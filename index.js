@@ -22,10 +22,7 @@ fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
 // ===== DB =====
-import pg from 'pg';
-const { Pool } = pg;
 
-const DATABASE_URL = process.env.DATABASE_URL;
 const PGSSL = process.env.PGSSL || 'require';         // 'require' or 'verify_full'
 const PGSSL_CA = process.env.PGSSL_CA || '';          // PEM text
 const PGSSL_CA_B64 = process.env.PGSSL_CA_B64 || '';  // optional: base64 of PEM
