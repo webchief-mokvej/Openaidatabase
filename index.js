@@ -10,7 +10,7 @@ const { Pool } = pg;
 
 const PORT = process.env.PORT || 5050;
 const DATABASE_URL = process.env.DATABASE_URL;
-const PGSSL = process.env.PGSSL ?? 'require';
+
 
 if (!DATABASE_URL) {
   console.error('[config] DATABASE_URL is required');
@@ -22,19 +22,49 @@ fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
 // ===== DB =====
-// ===== DB =====
-const PGSSL = process.env.PGSSL ?? 'require';        // 'require' or 'verify_full'
-const PGSSL_CA = process.env.PGSSL_CA || null;       // PEM text (-----BEGIN CERTIFICATE----- ...)
+import pg from 'pg';
+const { Pool } = pg;
+
+const DATABASE_URL = process.env.DATABASE_URL;
+const PGSSL = process.env.PGSSL || 'require';         // 'require' or 'verify_full'
+const PGSSL_CA = process.env.PGSSL_CA || '';          // PEM text
+const PGSSL_CA_B64 = process.env.PGSSL_CA_B64 || '';  // optional: base64 of PEM
+
+if (!DATABASE_URL) {
+  console.error('[config] DATABASE_URL is required');
+  process.exit(1);
+}
+
+let ssl;
+if (PGSSL === 'require') {
+  // TLS on but don't verify CA (works on DO)
+  ssl = { rejectUnauthorized: false };
+} else if (PGSSL === 'verify_full') {
+  // Strict verification: need CA
+  const caPem = PGSSL_CA || (PGSSL_CA_B64 ? Buffer.from(PGSSL_CA_B64, 'base64').toString('utf8') : '');
+  if (!caPem) {
+    console.error('[config] PGSSL=verify_full but no PGSSL_CA/PGSSL_CA_B64 provided');
+    process.exit(1);
+  }
+  ssl = { ca: caPem }; // node-postgres enables TLS when 'ssl' is an object
+} else {
+  // anything else → no TLS (will fail on DO with "no encryption")
+  ssl = false;
+}
+
+console.log('[db] init', { mode: PGSSL, hasPem: !!PGSSL_CA, hasB64: !!PGSSL_CA_B64 });
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl:
-    PGSSL === 'verify_full'
-      ? { ca: PGSSL_CA, rejectUnauthorized: true }   // strict verify (needs CA)
-      : PGSSL === 'require'
-        ? { rejectUnauthorized: false }              // TLS but no CA verification
-        : false
+  connectionString: DATABASE_URL,
+  ssl
 });
+
+// Quick health endpoint to confirm DB TLS mode in prod
+fastify.get('/db-ping', async (_req, reply) => {
+  await pool.query('select 1');
+  reply.send({ ok: 1, mode: PGSSL, hasPem: !!PGSSL_CA, hasB64: !!PGSSL_CA_B64, t: new Date().toISOString() });
+});
+
 
 async function loadAgent(agentId) {
   const { rows } = await pool.query(
