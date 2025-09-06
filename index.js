@@ -11,7 +11,6 @@ const { Pool } = pg;
 const PORT = process.env.PORT || 5050;
 const DATABASE_URL = process.env.DATABASE_URL;
 
-
 if (!DATABASE_URL) {
   console.error('[config] DATABASE_URL is required');
   process.exit(1);
@@ -21,48 +20,38 @@ const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-// ===== DB =====
-
+// ===== DB (TLS) =====
 const PGSSL = process.env.PGSSL || 'require';         // 'require' or 'verify_full'
-const PGSSL_CA = process.env.PGSSL_CA || '';          // PEM text
-const PGSSL_CA_B64 = process.env.PGSSL_CA_B64 || '';  // optional: base64 of PEM
-
-if (!DATABASE_URL) {
-  console.error('[config] DATABASE_URL is required');
-  process.exit(1);
-}
+const PGSSL_CA = process.env.PGSSL || process.env.PGSSL_CA || '';  // allow old var too
+const PGSSL_CA_B64 = process.env.PGSSL_CA_B64 || '';
 
 let ssl;
 if (PGSSL === 'require') {
-  // TLS on but don't verify CA (works on DO)
   ssl = { rejectUnauthorized: false };
 } else if (PGSSL === 'verify_full') {
-  // Strict verification: need CA
-  const caPem = PGSSL_CA || (PGSSL_CA_B64 ? Buffer.from(PGSSL_CA_B64, 'base64').toString('utf8') : '');
+  const caPem = (process.env.PGSSL_CA || '') || (PGSSL_CA_B64 ? Buffer.from(PGSSL_CA_B64, 'base64').toString('utf8') : '');
   if (!caPem) {
     console.error('[config] PGSSL=verify_full but no PGSSL_CA/PGSSL_CA_B64 provided');
     process.exit(1);
   }
-  ssl = { ca: caPem }; // node-postgres enables TLS when 'ssl' is an object
+  ssl = { ca: caPem };
 } else {
-  // anything else → no TLS (will fail on DO with "no encryption")
-  ssl = false;
+  ssl = false; // will fail on DO; keep for local only
 }
 
-console.log('[db] init', { mode: PGSSL, hasPem: !!PGSSL_CA, hasB64: !!PGSSL_CA_B64 });
+console.log('[db] init', { mode: PGSSL, hasPem: !!process.env.PGSSL_CA, hasB64: !!PGSSL_CA_B64 });
 
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl
-});
+const pool = new Pool({ connectionString: DATABASE_URL, ssl });
 
-// Quick health endpoint to confirm DB TLS mode in prod
+// Health
+fastify.get('/healthz', async (_req, reply) => reply.send({ ok: true, t: new Date().toISOString() }));
 fastify.get('/db-ping', async (_req, reply) => {
   await pool.query('select 1');
-  reply.send({ ok: 1, mode: PGSSL, hasPem: !!PGSSL_CA, hasB64: !!PGSSL_CA_B64, t: new Date().toISOString() });
+  reply.send({ ok: 1, mode: PGSSL, hasPem: !!process.env.PGSSL_CA, hasB64: !!PGSSL_CA_B64, t: new Date().toISOString() });
 });
+fastify.get('/', async (_req, reply) => reply.send({ message: 'Twilio Media Stream Server is running!' }));
 
-
+// ===== DB helpers =====
 async function loadAgent(agentId) {
   const { rows } = await pool.query(
     `SELECT
@@ -87,11 +76,10 @@ async function loadAgent(agentId) {
      FROM agents
      WHERE id = $1
      LIMIT 1`,
-     [agentId]
+    [agentId]
   );
   return rows[0] || null;
 }
-
 function missingFields(agent) {
   const need = [
     'system_message',
@@ -101,14 +89,10 @@ function missingFields(agent) {
     'twilio_account_sid',
     'twilio_auth_token'
   ];
-  const missing = need.filter(k => !agent?.[k]);
-  return missing;
+  return need.filter(k => !agent?.[k]);
 }
 
-// ===== In-memory call context (per CallSid) =====
-/**
- * callCtx[callSid] = { agentId, agentRow, callerFrom }
- */
+// ===== In-memory (best-effort only) =====
 const callCtx = new Map();
 
 // ===== Tokens / Markers =====
@@ -118,7 +102,7 @@ const CAPTURE_JSON_START = '[[CAPTURE_JSON]]';
 const CAPTURE_JSON_END   = '[[/CAPTURE_JSON]]';
 const TRANSFER_TOKEN = '<TRANSFER_AGENT>';
 
-// ===== Logging helpers =====
+// ===== Logging =====
 const LOG_EVENT_TYPES = [
   'error','rate_limits.updated','session.created','session.updated',
   'response.created','response.output_text.delta','response.output_text.done','response.done',
@@ -142,46 +126,36 @@ function xmlEscape(s) {
     .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 }
 
-// ===== Twilio REST helpers (STRICT: only DB creds) =====
+// ===== Twilio REST helpers =====
 async function hangupCall(callSid, twilioSid, twilioToken) {
-  if (!twilioSid || !twilioToken || !callSid) {
-    console.error('[twilio] hangup missing creds or CallSid'); return;
-  }
+  if (!twilioSid || !twilioToken || !callSid) { console.error('[twilio] hangup missing creds or CallSid'); return; }
   const url = `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Calls/${callSid}.json`;
   const body = new URLSearchParams({ Status: 'completed' });
   const auth = Buffer.from(`${twilioSid}:${twilioToken}`).toString('base64');
   try {
-    const res = await fetch(url, { method: 'POST',
-      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body
-    });
+    const res = await fetch(url, { method: 'POST', headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' }, body });
     if (!res.ok) console.error('[twilio] hangup failed', callSid, res.status);
     else console.log('[twilio] hangup requested', callSid);
   } catch (e) { console.error('[twilio] hangup error', e); }
 }
 
-async function transferCall(callSid, baseUrl, twilioSid, twilioToken) {
-  if (!twilioSid || !twilioToken || !callSid) {
-    console.error('[twilio] transfer missing creds or CallSid'); return;
+async function transferCall(callSid, baseUrl, agentId, twilioSid, twilioToken) {
+  if (!twilioSid || !twilioToken || !callSid || !agentId) {
+    console.error('[twilio] transfer missing creds/CallSid/agentId'); return;
   }
   const url = `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Calls/${callSid}.json`;
-  const twimlUrl = `https://${baseUrl}/transfer`;
+  const twimlUrl = `https://${baseUrl}/transfer/${encodeURIComponent(agentId)}`;
   const body = new URLSearchParams({ Url: twimlUrl });
   const auth = Buffer.from(`${twilioSid}:${twilioToken}`).toString('base64');
   try {
-    const res = await fetch(url, { method: 'POST',
-      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body
-    });
-    if (!res.ok) console.error('[twilio] transfer failed', res.status);
-    else console.log('[twilio] transfer redirect requested', callSid, '-> /transfer');
+    const res = await fetch(url, { method: 'POST', headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+    if (!res.ok) console.error('[twilio] transfer failed', res.status, await res.text());
+    else console.log('[twilio] transfer redirect requested', callSid, '->', twimlUrl);
   } catch (e) { console.error('[twilio] transfer error', e); }
 }
 
 async function startCallRecording(callSid, recCbUrl, twilioSid, twilioToken) {
-  if (!twilioSid || !twilioToken || !callSid) {
-    console.error('[twilio] start recording missing creds or CallSid'); return null;
-  }
+  if (!twilioSid || !twilioToken || !callSid) { console.error('[twilio] start recording missing creds or CallSid'); return null; }
   const url = `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Calls/${callSid}/Recordings.json`;
   const auth = Buffer.from(`${twilioSid}:${twilioToken}`).toString('base64');
   const body = new URLSearchParams({
@@ -191,17 +165,13 @@ async function startCallRecording(callSid, recCbUrl, twilioSid, twilioToken) {
     ...(recCbUrl ? { RecordingStatusCallback: recCbUrl, RecordingStatusCallbackMethod: 'POST' } : {})
   });
   try {
-    const res = await fetch(url, { method: 'POST',
-      headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body
-    });
+    const res = await fetch(url, { method: 'POST', headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' }, body });
     if (!res.ok) console.error('[twilio] start recording failed', res.status, await res.text());
     else console.log('[twilio] recording started for', callSid);
     return res.ok ? await res.json().catch(() => null) : null;
   } catch (e) { console.error('[twilio] start recording error', e); return null; }
 }
 
-// From-number via Call resource
 async function fetchFromNumberViaRest(callSid, twilioSid, twilioToken) {
   if (!twilioSid || !twilioToken || !callSid) return '';
   const url  = `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Calls/${callSid}.json`;
@@ -211,17 +181,12 @@ async function fetchFromNumberViaRest(callSid, twilioSid, twilioToken) {
     if (!res.ok) { console.error('[twilio] calls fetch failed', res.status); return ''; }
     const json = await res.json();
     return json.from_formatted || json.from || '';
-  } catch (e) {
-    console.error('[twilio] calls fetch error', e);
-    return '';
-  }
+  } catch (e) { console.error('[twilio] calls fetch error', e); return ''; }
 }
 
-// Pipedream POST (STRICT: requires url)
+// Pipedream POST
 async function postCaptureToPipedream(payload, captureUrl, captureAuth) {
-  if (!captureUrl) {
-    console.error('[capture] pipedream_url missing in agent config'); return;
-  }
+  if (!captureUrl) { console.error('[capture] pipedream_url missing in agent config'); return; }
   try {
     const headers = { 'Content-Type': 'application/json' };
     if (captureAuth) headers['Authorization'] = `Bearer ${captureAuth}`;
@@ -230,38 +195,38 @@ async function postCaptureToPipedream(payload, captureUrl, captureAuth) {
   } catch (e) { console.error('[capture] error', e); }
 }
 
-// ===== Health =====
-fastify.get('/healthz', async (_req, reply) => reply.send({ ok: true, t: nowIso() }));
-
-
-fastify.get('/', async (_req, reply) => reply.send({ message: 'Twilio Media Stream Server is running!' }));
-
-// ===== TwiML: transfer (resolve agent by CallSid) =====
-fastify.all('/transfer', async (req, reply) => {
-  const callSid = req.body?.CallSid || req.query?.CallSid || '';
-  const ctx = callCtx.get(callSid);
-  const agent = ctx?.agentRow;
-
-  if (!agent) {
-    console.error('[transfer] no agent context for CallSid', callSid);
+// ===== TwiML: stateless transfer (by agentId) =====
+fastify.all('/transfer/:agentId', async (req, reply) => {
+  const { agentId } = req.params;
+  const agent = await loadAgent(agentId);
+  if (!agent?.agent_number) {
     reply.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>Transfer unavailable.</Say></Response>`);
     return;
   }
-  if (!agent.agent_number) {
-    console.error('[transfer] agent_number missing for agent', agent.id);
-    reply.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>Transfer number not configured.</Say></Response>`);
-    return;
-  }
-
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Dial>${xmlEscape(agent.agent_number)}</Dial>
 </Response>`;
-  console.log('[transfer] dialing', agent.agent_number, 'for CallSid', callSid, 'agent', agent.id);
   reply.type('text/xml').send(twiml);
 });
 
-// ===== TwiML: incoming-call (STRICT: must find agent + required fields) =====
+// (Optional legacy) transfer depending on in-memory ctx
+fastify.all('/transfer', async (req, reply) => {
+  const callSid = req.body?.CallSid || req.query?.CallSid || '';
+  const ctx = callCtx.get(callSid);
+  const agent = ctx?.agentRow;
+  if (!agent?.agent_number) {
+    reply.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>Transfer unavailable.</Say></Response>`);
+    return;
+  }
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial>${xmlEscape(agent.agent_number)}</Dial>
+</Response>`;
+  reply.type('text/xml').send(twiml);
+});
+
+// ===== TwiML: incoming-call (now embeds agentId/callSid in the Stream URL) =====
 fastify.all('/incoming-call/:agentId', async (request, reply) => {
   const { agentId } = request.params;
   const from    = request.body?.From    || request.query?.From    || '';
@@ -285,10 +250,17 @@ fastify.all('/incoming-call/:agentId', async (request, reply) => {
 
   if (callSid) callCtx.set(callSid, { agentId, agentRow: agent, callerFrom: from });
 
+  // ✨ include agentId/callSid/host in the WS URL query
+  const streamUrl =
+    `wss://${host}/media-stream` +
+    `?agentId=${encodeURIComponent(agentId)}` +
+    `&callSid=${encodeURIComponent(callSid)}` +
+    `&host=${encodeURIComponent(host)}`;
+
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://${host}/media-stream">
+    <Stream url="${streamUrl}">
       <Parameter name="agentId" value="${xmlEscape(agentId)}"/>
       <Parameter name="from" value="${xmlEscape(from)}"/>
       <Parameter name="callSid" value="${xmlEscape(callSid)}"/>
@@ -299,7 +271,7 @@ fastify.all('/incoming-call/:agentId', async (request, reply) => {
   reply.type('text/xml').send(twimlResponse);
 });
 
-// Recording status: log SID + URL when completed
+// Recording status
 fastify.post('/recording-status/:agentId', async (req, reply) => {
   const { agentId } = req.params || {};
   const { CallSid, RecordingSid, RecordingStatus, RecordingUrl } = req.body || {};
@@ -312,7 +284,7 @@ fastify.post('/recording-status/:agentId', async (req, reply) => {
   reply.send('ok');
 });
 
-// ===== Media Stream =====
+// ===== Media Stream (WebSocket) =====
 fastify.register(async (app) => {
   app.get('/media-stream', { websocket: true }, (connection, req) => {
     console.log('[ws] Twilio connected');
@@ -359,19 +331,27 @@ fastify.register(async (app) => {
       END_TOKEN.length, CAPTURE_TOKEN.length, CAPTURE_JSON_START.length, CAPTURE_JSON_END.length, TRANSFER_TOKEN.length
     );
 
-    function escapeForRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-    function sendMark() { if (streamSid) connection.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'responsePart' } })); }
+    const escapeForRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const sendMark = () => { if (streamSid) connection.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'responsePart' } })); };
+
+    // ✨ NEW: read agentId/callSid/host from WS URL query immediately
+    try {
+      const forwardedHost = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+      const u = new URL(req.url, `https://${forwardedHost}`);
+      const qAgent = u.searchParams.get('agentId');
+      const qCall  = u.searchParams.get('callSid');
+      const qHost  = u.searchParams.get('host');
+      if (qAgent) agentId = qAgent;
+      if (qCall)  callSid = qCall;
+      if (qHost)  baseHost = qHost;
+    } catch (e) {
+      console.warn('[ws] failed to parse URL query', e);
+    }
 
     function checkAndHandleTokens(combined) {
-      if (!captureTokenSeen && combined.includes(CAPTURE_TOKEN)) {
-        captureTokenSeen = true; console.log('[token]', agentId, callSid, 'CAPTURE_TOKEN seen');
-      }
-      if (!endTokenSeen && combined.includes(END_TOKEN)) {
-        endTokenSeen = true; console.log('[token]', agentId, callSid, 'END_TOKEN seen');
-      }
-      if (!transferTokenSeen && combined.includes(TRANSFER_TOKEN)) {
-        transferTokenSeen = true; console.log('[token]', agentId, callSid, 'TRANSFER_TOKEN seen');
-      }
+      if (!captureTokenSeen && combined.includes(CAPTURE_TOKEN)) { captureTokenSeen = true; console.log('[token]', agentId, callSid, 'CAPTURE_TOKEN'); }
+      if (!endTokenSeen && combined.includes(END_TOKEN))         { endTokenSeen = true;     console.log('[token]', agentId, callSid, 'END_TOKEN'); }
+      if (!transferTokenSeen && combined.includes(TRANSFER_TOKEN)) { transferTokenSeen = true; console.log('[token]', agentId, callSid, 'TRANSFER_TOKEN'); }
     }
     function stripNonSpoken(text) {
       let out = text.replaceAll(CAPTURE_TOKEN,'').replaceAll(END_TOKEN,'').replaceAll(TRANSFER_TOKEN,'');
@@ -398,11 +378,7 @@ fastify.register(async (app) => {
         let text = '';
         for (const item of out) {
           if (item?.type === 'message' && Array.isArray(item.content)) {
-            for (const c of item.content) {
-              if ((c?.type === 'output_text' || c?.type === 'text') && typeof c?.text === 'string') {
-                text += (text ? ' ' : '') + c.text;
-              }
-            }
+            for (const c of item.content) if ((c?.type === 'output_text' || c?.type === 'text') && typeof c?.text === 'string') text += (text ? ' ' : '') + c.text;
           }
           if (!text && typeof item?.text === 'string') text = item.text;
         }
@@ -410,7 +386,7 @@ fastify.register(async (app) => {
       } catch { return ''; }
     }
 
-    // ===== ElevenLabs (strict: DB values only) =====
+    // ===== ElevenLabs =====
     function createElevenSocket(xiKey, voiceId, modelId) {
       const url =
         `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input` +
@@ -431,11 +407,7 @@ fastify.register(async (app) => {
     function ensureEleven() {
       if (elevenWs && elevenOpen) return;
       if (elevenWs && !elevenOpen) return;
-
-      if (!agent?.eleven_api_key || !agent?.eleven_voice_id) {
-        console.error('[eleven] missing keys/voice for agent', agentId);
-        return;
-      }
+      if (!agent?.eleven_api_key || !agent?.eleven_voice_id) { console.error('[eleven] missing keys/voice for agent', agentId); return; }
       elevenWs = createElevenSocket(agent.eleven_api_key, agent.eleven_voice_id, agent.eleven_model_id || 'eleven_turbo_v2_5');
       elevenOpen = false;
 
@@ -468,12 +440,9 @@ fastify.register(async (app) => {
       elevenWs.on('error', (e) => { console.error('[eleven] WS error', e); });
     }
 
-    // ===== OpenAI Realtime (strict: DB key only) =====
+    // ===== OpenAI Realtime =====
     function createAndWireOpenAi() {
-      if (!agent?.openai_api_key) {
-        console.error('[ai] missing openai_api_key for agent', agentId);
-        return;
-      }
+      if (!agent?.openai_api_key) { console.error('[ai] missing openai_api_key for agent', agentId); return; }
       const openAi = new WebSocket(
         'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
         { headers: { Authorization: `Bearer ${agent.openai_api_key}`, 'OpenAI-Beta': 'realtime=v1' } }
@@ -500,10 +469,9 @@ fastify.register(async (app) => {
           }
         };
         console.log('[ai] session.update', agentId, sessionUpdate.session.turn_detection);
-        openAi.send(JSON.stringify(sessionUpdate));
 
         // Initial greeting
-        console.log('[ai] sending initial greeting');
+        openAi.send(JSON.stringify(sessionUpdate));
         openAi.send(JSON.stringify({
           type: 'response.create',
           response: {
@@ -523,7 +491,6 @@ fastify.register(async (app) => {
             isResponseInProgress = true;
             sawTextDelta = false;
             suppressTts = false;
-            console.log('[ai] response.created', activeResponseId);
           }
 
           if (msg.type === 'response.output_text.delta' && typeof msg.delta === 'string') {
@@ -536,8 +503,6 @@ fastify.register(async (app) => {
             sawTextDelta = true;
 
             if (deltaSpeak) { ensureEleven(); sendToEleven({ text: deltaSpeak, try_trigger_generation: true }); isTtsSpeaking = true; sendMark(); }
-            const preview = deltaSpeak.replace(/\s+/g,' ').slice(0,120);
-            if (preview) console.log('[ai] delta:', preview);
           }
 
           if (msg.type === 'response.output_text.done' && typeof msg.text === 'string' && msg.text.length && !sawTextDelta) {
@@ -545,7 +510,6 @@ fastify.register(async (app) => {
             scanBuf += textRaw; tryParseCaptureJsonBlocks();
             const text = stripNonSpoken(textRaw);
             if (text) { ensureEleven(); sendToEleven({ text, try_trigger_generation: true }); isTtsSpeaking = true; }
-            console.log('[ai] output_text.done len', text?.length ?? 0);
           }
 
           if (msg.type === 'response.done') {
@@ -555,9 +519,6 @@ fastify.register(async (app) => {
                 scanBuf += finalTextRaw; tryParseCaptureJsonBlocks();
                 const cleaned = stripNonSpoken(finalTextRaw);
                 if (cleaned) { ensureEleven(); sendToEleven({ text: cleaned, try_trigger_generation: true }); isTtsSpeaking = true; }
-                console.log('[ai] final text:', cleaned?.replace(/\s+/g,' ').slice(0,160) || '(empty)');
-              } else {
-                console.warn('[ai] response.done but no text');
               }
             }
 
@@ -571,18 +532,15 @@ fastify.register(async (app) => {
                 agent.pipedream_url,
                 agent.pipedream_auth
               );
-              console.log('[capture] posted once');
               captureTokenSeen = false; captureJsonReady = false; captureJson = null; scanBuf = '';
             }
 
             if (transferTokenSeen) {
               transferTokenSeen = false;
-              console.log('[call] transfer token seen → redirect');
-              setTimeout(() => { transferCall(callSid, baseHost, agent.twilio_account_sid, agent.twilio_auth_token); }, 1500);
+              setTimeout(() => { transferCall(callSid, baseHost, agent.id, agent.twilio_account_sid, agent.twilio_auth_token); }, 1500);
             }
 
             if (endTokenSeen) {
-              console.log('[call] end token seen → hangup');
               setTimeout(() => {
                 hangupCall(callSid, agent.twilio_account_sid, agent.twilio_auth_token);
                 try { connection.close(); } catch {}
@@ -599,21 +557,16 @@ fastify.register(async (app) => {
           if (msg.type === 'input_audio_buffer.speech_started') {
             const now = Date.now();
             if (now - lastUserAudioAt < 1500) {
-              console.log('[barge-in] suppress TTS');
               suppressTts = true;
               if (isResponseInProgress) {
-                try { openAi.send(JSON.stringify({ type: 'response.cancel' })); console.log('[barge-in] response.cancel'); } catch {}
+                try { openAi.send(JSON.stringify({ type: 'response.cancel' })); } catch {}
               }
               connection.send(JSON.stringify({ event: 'clear', streamSid }));
             }
           }
           if (msg.type === 'input_audio_buffer.speech_stopped') {
-            console.log('[ai] speech_stopped → resume TTS'); suppressTts = false;
+            suppressTts = false;
           }
-          if (msg.type === 'input_audio_buffer.committed') {
-            console.log('[ai] audio committed');
-          }
-
           if (msg.type === 'error') { console.error('[ai] error', msg.error); }
         } catch (e) {
           console.error('Error processing OpenAI message:', e, 'Raw:', data);
@@ -638,30 +591,25 @@ fastify.register(async (app) => {
             streamSid = data.start.streamSid;
             callSid   = data.start.callSid || callSid;
 
+            // Still parse <Parameter/> if present (good to have)
             const params = {};
             const raw = data.start?.customParameters ?? data.start?.custom_parameters;
             if (Array.isArray(raw)) for (const p of raw) if (p && typeof p === 'object' && 'name' in p) params[p.name] = p.value ?? '';
             else if (raw && typeof raw === 'object') for (const [k, v] of Object.entries(raw)) params[k] = v ?? '';
 
             agentId    = params.agentId || agentId;
-            callerFrom = params.from || '';
-            baseHost   = params.host || req.headers['x-forwarded-host'] || req.headers.host;
+            callerFrom = params.from || callerFrom;
+            baseHost   = params.host || baseHost || req.headers['x-forwarded-host'] || req.headers.host;
 
-            // Get agent from memory or DB
+            // Load agent (DB path is authoritative)
             const cached = callCtx.get(callSid);
-            if (cached?.agentRow) {
-              agent = cached.agentRow;
-            } else if (agentId) {
-              agent = await loadAgent(agentId);
-            }
+            if (cached?.agentRow) agent = cached.agentRow;
+            if (!agent && agentId) agent = await loadAgent(agentId);
 
-            if (!agent) { console.error('[start] agent not found', { agentId, callSid }); return; }
+            if (!agent) { console.error('[start] agent not found', { agentId, callSid }); try { connection.close(); } catch {} ; return; }
 
             const miss = missingFields(agent);
-            if (miss.length) {
-              console.error('[start] agent misconfigured', agentId, 'missing:', miss);
-              return;
-            }
+            if (miss.length) { console.error('[start] agent misconfigured', agentId, 'missing:', miss); try { connection.close(); } catch {} ; return; }
 
             console.log('[twilio] stream start', { agentId, streamSid, callSid, from: callerFrom || '(empty)', host: baseHost || '(empty)' });
 
@@ -680,7 +628,8 @@ fastify.register(async (app) => {
 
             latestMediaTimestamp = 0;
             lastUserAudioAt = Date.now();
-            // Store/refresh context
+
+            // Best-effort store
             callCtx.set(callSid, { agentId: agent.id, agentRow: agent, callerFrom });
             break;
           }
@@ -695,9 +644,6 @@ fastify.register(async (app) => {
             }
             break;
           }
-
-          case 'mark':
-            break;
 
           case 'stop':
             console.log('[twilio] event stop');
