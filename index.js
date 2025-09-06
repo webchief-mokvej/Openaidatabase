@@ -22,9 +22,18 @@ fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
 // ===== DB =====
+// ===== DB =====
+const PGSSL = process.env.PGSSL ?? 'require';        // 'require' or 'verify_full'
+const PGSSL_CA = process.env.PGSSL_CA || null;       // PEM text (-----BEGIN CERTIFICATE----- ...)
+
 const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: PGSSL === 'require' ? { rejectUnauthorized: false } : false
+  connectionString: process.env.DATABASE_URL,
+  ssl:
+    PGSSL === 'verify_full'
+      ? { ca: PGSSL_CA, rejectUnauthorized: true }   // strict verify (needs CA)
+      : PGSSL === 'require'
+        ? { rejectUnauthorized: false }              // TLS but no CA verification
+        : false
 });
 
 async function loadAgent(agentId) {
