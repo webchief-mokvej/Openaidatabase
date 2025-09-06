@@ -232,10 +232,7 @@ async function postCaptureToPipedream(payload, captureUrl, captureAuth) {
 
 // ===== Health =====
 fastify.get('/healthz', async (_req, reply) => reply.send({ ok: true, t: nowIso() }));
-fastify.get('/db-ping', async (_req, reply) => {
-  await pool.query('select 1');
-  reply.send({ ok: 1, t: new Date().toISOString() });
-});
+
 
 fastify.get('/', async (_req, reply) => reply.send({ message: 'Twilio Media Stream Server is running!' }));
 
